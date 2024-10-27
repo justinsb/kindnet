@@ -53,13 +53,27 @@ func NewDNSCacheAgent(nodeName string, nodeInformer coreinformers.NodeInformer) 
 	if err != nil {
 		return nil, err
 	}
+	// kindnet is using hostNetwork and dnsPolicy: ClusterFirstWithHostNet
+	// so its resolv.conf will have the configuration from the network Pods
+	klog.Info("Configuring upstream DNS resolver")
+	hostDNS, hostSearch, hostOptions, err := parseResolvConf()
+	if err != nil {
+		err := fmt.Errorf("encountered error while parsing resolv conf file. Error: %w", err)
+		klog.ErrorS(err, "Could not parse resolv conf file.")
+		return nil, err
+	}
+
+	klog.V(2).Infof("Parsed resolv.conf: nameservers: %v search: %v options: %v", hostDNS, hostSearch, hostOptions)
 
 	d := &DNSCacheAgent{
 		nft:         nft,
 		nodeName:    nodeName,
+		nameServer:  hostDNS[0],
+		searches:    hostSearch,
 		nodeLister:  nodeInformer.Lister(),
 		nodesSynced: nodeInformer.Informer().HasSynced,
-		interval:    5 * time.Minute,
+		interval:    1 * time.Minute,
+		proxy:       NewDNSProxy(hostDNS[0]),
 	}
 
 	return d, nil
@@ -88,21 +102,9 @@ func (d *DNSCacheAgent) Run(ctx context.Context) error {
 	if !cache.WaitForNamedCacheSync("kindnet-dnscache", ctx.Done(), d.nodesSynced) {
 		return fmt.Errorf("error syncing cache")
 	}
-	// kindnet is using hostNetwork and dnsPolicy: ClusterFirstWithHostNet
-	// so its resolv.conf will have the configuration from the network Pods
-	klog.Info("Configuring upstream DNS resolver")
-	hostDNS, hostSearch, hostOptions, err := parseResolvConf()
-	if err != nil {
-		err := fmt.Errorf("encountered error while parsing resolv conf file. Error: %w", err)
-		klog.ErrorS(err, "Could not parse resolv conf file.")
-		return err
-	}
-	d.nameServer = hostDNS[0]
-	d.searches = hostSearch
-	klog.V(2).Infof("Parsed resolv.conf: nameservers: %v search: %v options: %v", hostDNS, hostSearch, hostOptions)
 
 	klog.Info("Waiting for node parameters")
-	err = wait.PollUntilContextCancel(ctx, 1*time.Second, true, func(context.Context) (bool, error) {
+	err := wait.PollUntilContextCancel(ctx, 1*time.Second, true, func(context.Context) (bool, error) {
 		node, err := d.nodeLister.Get(d.nodeName)
 		if err != nil {
 			return false, nil
@@ -120,11 +122,22 @@ func (d *DNSCacheAgent) Run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	klog.Info("Starting dns proxy")
-	err = d.proxy.Start()
-	if err != nil {
-		return err
+	go func() {
+		for {
+			klog.Info("Starting dns proxy")
+			err = d.proxy.Start()
+			if err != nil {
+				klog.Errorf("dns proxy stopped with error: %v , restarting in 5 seconds ...", err)
+				time.Sleep(5 * time.Second)
+			}
+		}
+	}()
+
+	for d.proxy.GetLocalAddr() == "" {
+		klog.Info("Waiting for dns proxy to start")
+		time.Sleep(1 * time.Second)
 	}
+
 	klog.Info("Syncing local route rules")
 	err = d.syncLocalRoute()
 	if err != nil {
@@ -153,10 +166,7 @@ func (d *DNSCacheAgent) Run(ctx context.Context) error {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-d.proxy.ReadyChannel():
-			err = d.proxy.Start()
-			if err != nil {
-				return err
-			}
+			continue
 		case <-ticker.C:
 			continue
 		}
@@ -257,10 +267,11 @@ func (d *DNSCacheAgent) SyncRules(ctx context.Context) error {
 				"ip saddr", d.podCIDRv4,
 				"ip daddr", d.nameServer,
 				"meta l4proto udp th dport 53",
-				"socket transparent 1",
+				//"socket transparent 1",
 				"tproxy ip to", d.proxy.GetLocalAddr(),
 				"meta mark set", tproxyMark,
 				"notrack",
+				"counter",
 				"accept",
 			), // set a mark to check if there is abug in the kernel when creating the entire expression
 			Comment: ptr.To("DNS IPv4 pod originated traffic"),
@@ -275,9 +286,10 @@ func (d *DNSCacheAgent) SyncRules(ctx context.Context) error {
 				"ip6 saddr", d.podCIDRv6,
 				"ip6 daddr", d.nameServer,
 				"meta l4proto udp th dport 53",
-				"socket transparent 1",
+				// "socket transparent 1",
 				"tproxy ip6 to", d.proxy.GetLocalAddr(),
 				"meta mark set", tproxyMark,
+				"counter",
 				"notrack",
 				"accept",
 			),

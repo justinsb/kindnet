@@ -19,6 +19,7 @@ package main
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"net"
 	"sync"
@@ -143,11 +144,11 @@ type DNSProxy struct {
 	cache      *ipCache
 }
 
-func NewDNSProxy(nameServer string, cache *ipCache) *DNSProxy {
+func NewDNSProxy(nameServer string) *DNSProxy {
 	return &DNSProxy{
+		nameServer: nameServer,
 		closeCh:    make(chan struct{}),
 		connCh:     make(chan net.Conn),
-		nameServer: nameServer,
 		cache:      newIPCache(),
 	}
 }
@@ -172,8 +173,11 @@ func (d *DNSProxy) Start() error {
 		return err
 	}
 	defer dnsTCPConn.Close()
-	// return the connection to the channel
-	d.connCh <- dnsTCPConn
+	go func() {
+		klog.V(2).Infof("connected to %s", net.JoinHostPort(d.nameServer, "53"))
+		// return the connection to the channel
+		d.connCh <- dnsTCPConn
+	}()
 
 	d.resolver = &net.Resolver{
 		PreferGo: true,
@@ -185,8 +189,10 @@ func (d *DNSProxy) Start() error {
 				}
 				return nil, fmt.Errorf("connection channel closed")
 			case <-ctx.Done():
+				d.Stop()
 				return nil, ctx.Err()
 			case <-time.After(5 * time.Second):
+				d.Stop()
 				return nil, fmt.Errorf("error waiting for available connection")
 			}
 		},
@@ -218,6 +224,11 @@ func (d *DNSProxy) Start() error {
 			// https://kb.isc.org/docs/behavior-dig-versions-edns-bufsize
 			buf := make([]byte, maxDNSSize)
 			n, addr, err := conn.ReadFrom(buf)
+			if errors.Is(err, net.ErrClosed) {
+				klog.Infof("exiting, UDP connection closed: %v", err)
+				d.Stop()
+				return
+			}
 			if err != nil {
 				klog.Infof("error on UDP connection: %v", err)
 				continue
@@ -229,7 +240,7 @@ func (d *DNSProxy) Start() error {
 
 	// purge the cache periodically
 	go func() {
-		ticker := time.NewTicker(30 * time.Second)
+		ticker := time.NewTicker(expireTimeout)
 		defer ticker.Stop()
 		for {
 			select {
@@ -334,7 +345,7 @@ func (d *DNSProxy) passThrough(b []byte) ([]byte, error) {
 	if !ok {
 		return buf, fmt.Errorf("connection channel closed")
 	}
-	// return the connection to the channel
+	// return the connection to the channel or stop the proxy
 	defer func() {
 		if err != nil {
 			d.Stop()
