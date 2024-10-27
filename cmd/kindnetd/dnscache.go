@@ -317,7 +317,7 @@ func (d *DNSCacheAgent) Run(ctx context.Context) error {
 func (d *DNSCacheAgent) serveDNS(addr net.Addr, data []byte) {
 	// it must answer with the origin the DNS server used to cache
 	// and destination the same original address
-	klog.V(2).Infof("dialing from %s:%d to %s", d.nameServer, 53, addr.String())
+	klog.V(4).Infof("dialing from %s:%d to %s", d.nameServer, 53, addr.String())
 	bypassFreebindDialer := &net.Dialer{
 		LocalAddr: &net.UDPAddr{IP: net.ParseIP(d.nameServer), Port: 53},
 		Control: func(network, address string, c syscall.RawConn) error {
